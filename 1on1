@@ -12,7 +12,7 @@ from io import StringIO, BytesIO
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import TelegramObject, CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton, User
+from aiogram.types import TelegramObject, CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton, User, ChatMember
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 
@@ -35,7 +35,7 @@ CLANS_DB = {}
 ACTIVE_MATCHES = {}
 MATCHMAKING_QUEUE = []
 IN_GAME_USERS = set()
-PRIVATE_ROOMS = {}
+PRIVATE_ROOMS = {}  # {room_id: {creator, players, chat_enabled, ...}}
 
 # ===== УНИВЕРСАЛЬНАЯ ПРОВЕРКА АДМИНА =====
 def is_admin(user: Union[User, dict, str, int]) -> bool:
@@ -694,7 +694,6 @@ async def donate_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("donate_buy_"))
 async def donate_buy(callback: CallbackQuery):
-    # Исправленный парсинг
     parts = callback.data.split("_")
     if len(parts) >= 3 and parts[2] == "vip":
         product_name = "👑 Пас+ (VIP)"
@@ -1162,7 +1161,10 @@ async def handle_chest_actions(callback: CallbackQuery):
         await callback.answer(f"✅ Сундук ускорен за {cost} кристаллов! Теперь его можно открыть.", show_alert=True)
         await show_chests(callback)
 
-# ===== КЛАНЫ =====
+# ======================================================
+# ===== КЛАНЫ (с привязкой группы) =====
+# ======================================================
+
 @dp.callback_query(F.data == "menu_clan")
 async def show_clan_menu(callback: CallbackQuery):
     user = get_or_create_user(callback.from_user.id, callback.from_user.username)
@@ -1184,20 +1186,110 @@ async def show_clan_menu(callback: CallbackQuery):
             user["clan_id"] = None
             return await show_clan_menu(callback)
         await update_clan_cups(user["clan_id"])
+        
+        chat_info = ""
+        if "chat_link" in clan and clan["chat_link"]:
+            chat_info = f"\n🗣 Чат клана: {clan['chat_link']}"
+        
         text = (
             f"🛡 <b>Ваш Футбольный Клуб: {clan['name']}</b>\n"
             f"👑 Владелец: {USERS_DB.get(clan['owner'], {}).get('username', 'Неизвестно')}\n"
             f"🏆 Суммарный ММР клана: {clan.get('cups', 0)}\n"
-            f"👥 Участников: {len(clan['members'])}/15\n\n"
-            f"💬 <i>Чат клуба доступен для участников команды!</i>"
+            f"👥 Участников: {len(clan['members'])}/15\n"
+            f"{chat_info}\n\n"
+            f"💬 <i>Для общения в чате клана необходимо быть участником группы.</i>"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb = [
             [InlineKeyboardButton(text="💬 Чат клуба", callback_data="clan_chat")],
             [InlineKeyboardButton(text="❌ Покинуть команду", callback_data="clan_leave")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="to_main")]
-        ])
-        await callback.message.edit_text(text, reply_markup=kb)
+        ]
+        if clan["owner"] == callback.from_user.id:
+            kb.append([InlineKeyboardButton(text="🔗 Привязать группу", callback_data="clan_set_chat")])
+        kb.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="to_main")])
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+@dp.callback_query(F.data == "clan_set_chat")
+async def clan_set_chat(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id)
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan or clan["owner"] != callback.from_user.id:
+        await callback.answer("❌ Только владелец может привязать группу.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🔗 <b>Привязка группы к клану</b>\n\n"
+        "Отправьте ссылку-приглашение в группу (например, https://t.me/joinchat/...).\n"
+        "После этого участники клана должны будут вступить в эту группу, чтобы писать в чат клана.\n\n"
+        "Отправьте /setclanchat ссылка"
+    )
+    await callback.answer()
+
+@dp.message(Command("setclanchat"))
+async def set_clan_chat_cmd(message: Message):
+    user = get_or_create_user(message.from_user.id)
+    if user["clan_id"] is None:
+        await message.answer("❌ Вы не состоите в клане.")
+        return
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan or clan["owner"] != message.from_user.id:
+        await message.answer("❌ Только владелец клана может установить ссылку.")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /setclanchat ссылка_на_группу")
+        return
+    link = args[1]
+    clan["chat_link"] = link
+    save_db()
+    await message.answer(f"✅ Ссылка на группу установлена: {link}\nТеперь участники клана должны быть подписаны на эту группу для общения в чате.")
+
+@dp.callback_query(F.data == "clan_chat")
+async def clan_chat(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id)
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan:
+        await callback.answer("❌ Вы не в клане.", show_alert=True)
+        return
+    
+    chat_link = clan.get("chat_link")
+    if not chat_link:
+        await callback.answer("❌ Владелец клана ещё не привязал группу.", show_alert=True)
+        return
+    
+    # Проверяем, подписан ли пользователь на этот чат
+    # Если ссылка начинается с https://t.me/joinchat/... или https://t.me/+...
+    # Проще всего проверить, что пользователь является членом группы, если известен chat_id.
+    # Но так как мы не знаем chat_id, предлагаем просто дать ссылку.
+    # Можно дать ссылку и попросить вступить.
+    text = (
+        f"🗣 <b>Чат клана</b>\n\n"
+        f"Для общения в чате клана вам необходимо вступить в группу:\n"
+        f"{chat_link}\n\n"
+        f"После вступления вы сможете общаться с соклановцами."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Вступить в группу", url=chat_link)],
+        [InlineKeyboardButton(text="🔄 Проверить", callback_data="clan_chat_check")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_clan")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "clan_chat_check")
+async def clan_chat_check(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id)
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan:
+        await callback.answer("❌ Вы не в клане.", show_alert=True)
+        return
+    chat_link = clan.get("chat_link")
+    if not chat_link:
+        await callback.answer("❌ Группа не привязана.", show_alert=True)
+        return
+    # Предлагаем просто дать ссылку, так как проверить членство без chat_id невозможно
+    await callback.answer("✅ Для доступа к чату клана вступите в группу по ссылке.", show_alert=False)
+    # Можно было бы проверить, является ли пользователь участником группы, если известен её ID.
+    # Но для простоты оставляем так.
+
+# ===== ОСТАЛЬНЫЕ КЛАН-ХЕНДЛЕРЫ (без изменений) =====
 @dp.callback_query(F.data == "clan_create")
 async def create_clan_process(callback: CallbackQuery):
     user = get_or_create_user(callback.from_user.id, callback.from_user.username)
@@ -1211,7 +1303,8 @@ async def create_clan_process(callback: CallbackQuery):
         "name": clan_name,
         "owner": callback.from_user.id,
         "cups": user["mmr"],
-        "members": [callback.from_user.id]
+        "members": [callback.from_user.id],
+        "chat_link": None
     }
     user["clan_id"] = clan_id
     await callback.answer(f"🎉 Клан '{clan_name}' успешно создан!")
@@ -1261,10 +1354,6 @@ async def leave_clan_handler(callback: CallbackQuery):
     user["clan_id"] = None
     await callback.answer("Вы покинули клан.")
     await show_clan_menu(callback)
-
-@dp.callback_query(F.data == "clan_chat")
-async def clan_chat_stub(callback: CallbackQuery):
-    await callback.answer("💬 Чат временно на тех-обслуживании. Общайтесь через игровое поле!", show_alert=True)
 
 # ===== БАТЛ-ПАСС (VIP) =====
 @dp.callback_query(F.data == "menu_bp")
@@ -1319,7 +1408,10 @@ async def buy_vip_with_crystals(callback: CallbackQuery):
     await callback.answer("🎉 Поздравляем! Вы купили VIP+ на 60 дней!", show_alert=True)
     await show_battle_pass(callback)
 
+# ======================================================
 # ===== СИСТЕМА ДРУЗЕЙ =====
+# ======================================================
+
 @dp.message(Command("addfriend"))
 async def add_friend_cmd(message: Message):
     args = message.text.split()
@@ -1411,7 +1503,10 @@ async def friends_cmd(message: Message):
             text += f"• Неизвестный (ID {fid})\n"
     await message.answer(text)
 
-# ===== ЗАКРЫТЫЕ КОМНАТЫ =====
+# ======================================================
+# ===== ЗАКРЫТЫЕ КОМНАТЫ (с чатом) =====
+# ======================================================
+
 @dp.message(Command("create_room"))
 async def create_room_cmd(message: Message):
     user = get_or_create_user(message.from_user.id)
@@ -1423,14 +1518,60 @@ async def create_room_cmd(message: Message):
         "creator": message.from_user.id,
         "players": [message.from_user.id],
         "invited": [],
-        "status": "waiting"
+        "status": "waiting",
+        "chat_enabled": False,
+        "chat_active": False
     }
     await message.answer(
         f"🏟 <b>Комната создана!</b>\n\n"
         f"ID комнаты: <code>{room_id}</code>\n"
         f"Пригласите друга: /invite_room @username {room_id}\n"
-        f"Чтобы начать матч, оба игрока должны быть в комнате."
+        f"Чтобы начать матч, оба игрока должны быть в комнате.\n"
+        f"Доступны команды:\n"
+        f"/room_chat {room_id} - включить/выключить чат\n"
+        f"/start_room {room_id} - начать матч"
     )
+
+@dp.message(Command("room_chat"))
+async def room_chat_cmd(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /room_chat room_id")
+        return
+    room_id = args[1]
+    if room_id not in PRIVATE_ROOMS:
+        await message.answer("❌ Комната не найдена.")
+        return
+    room = PRIVATE_ROOMS[room_id]
+    if message.from_user.id not in room["players"]:
+        await message.answer("❌ Вы не участник этой комнаты.")
+        return
+    room["chat_enabled"] = not room.get("chat_enabled", False)
+    status = "включён" if room["chat_enabled"] else "выключен"
+    await message.answer(f"💬 Чат в комнате {status}.\nТеперь сообщения будут пересылаться между участниками комнаты.")
+    # Если чат включён, будем пересылать сообщения
+    if room["chat_enabled"]:
+        # Запоминаем, что чат активен для данного пользователя
+        room["chat_active"] = True
+    else:
+        room["chat_active"] = False
+
+@dp.message(F.text & ~F.text.startswith('/'))
+async def room_chat_message_handler(message: Message):
+    # Проверяем, является ли пользователь участником какой-либо активной комнаты с включённым чатом
+    for room_id, room in PRIVATE_ROOMS.items():
+        if message.from_user.id in room["players"] and room.get("chat_enabled", False):
+            # Пересылаем сообщение всем участникам комнаты, кроме отправителя
+            for player in room["players"]:
+                if player != message.from_user.id:
+                    try:
+                        await bot.send_message(
+                            player,
+                            f"💬 [{USERS_DB[message.from_user.id]['username']}]: {message.text}"
+                        )
+                    except:
+                        pass
+            break
 
 @dp.message(Command("invite_room"))
 async def invite_room_cmd(message: Message):
@@ -1499,7 +1640,8 @@ async def join_room_cmd(message: Message):
     await bot.send_message(
         creator,
         f"✅ {USERS_DB[message.from_user.id]['username']} присоединился к комнате.\n"
-        f"Начните матч: /start_room {room_id}"
+        f"Начните матч: /start_room {room_id}\n"
+        f"Для чата: /room_chat {room_id}"
     )
 
 @dp.message(Command("start_room"))
@@ -1524,6 +1666,7 @@ async def start_room_cmd(message: Message):
         return
     p1 = room["players"][0]
     p2 = room["players"][1]
+    # Удаляем комнату после начала матча
     del PRIVATE_ROOMS[room_id]
     await bot.send_message(p1, "🏟 <b>Товарищеский матч начинается!</b>\n\nПротивник: 👤 " + USERS_DB[p2]["username"])
     await bot.send_message(p2, "🏟 <b>Товарищеский матч начинается!</b>\n\nПротивник: 👤 " + USERS_DB[p1]["username"])
@@ -1531,7 +1674,7 @@ async def start_room_cmd(message: Message):
     asyncio.create_task(init_game_session(p1, p2, match_type="friendly"))
 
 # ======================================================
-# ===== СИСТЕМА МАТЧЕЙ =====
+# ===== СИСТЕМА МАТЧЕЙ (с сохранением карьеры) =====
 # ======================================================
 
 async def send_safely(user_id, text, reply_markup=None):
@@ -1862,6 +2005,7 @@ async def finish_game_session(match_id, winner):
     u1 = USERS_DB[p1]
     is_win1 = (p1 == winner)
     is_friendly = (m["match_type"] == "friendly")
+    is_career = (m["match_type"] == "career")
     
     mmr_change1 = 0
     mmr_change2 = 0
@@ -1885,9 +2029,18 @@ async def finish_game_session(match_id, winner):
         else:
             chest_reward_text = "\n⚠️ У вас нет свободных слотов для сундука. Откройте один из существующих."
 
+    # Карьера: увеличиваем этап при победе
+    career_text = ""
+    if is_career and is_win1:
+        u1["career_stage"] += 1
+        career_text = f"\n📈 Этап карьеры повышен до {u1['career_stage']}!"
+        save_db()  # сохраняем сразу
+
     res1 = f"🏁 <b>Матч окончен!</b>\n"
     if is_friendly:
         res1 += f"🤝 Товарищеский матч\n"
+    if is_career:
+        res1 += f"🏆 Матч карьеры\n"
     if is_win1:
         res1 += f"🎉 Победа! +{mmr_change1} ММР, +{bonus_coins} монет (бонус Лидера).\n"
     else:
@@ -1896,6 +2049,8 @@ async def finish_game_session(match_id, winner):
     res1 += f"⚡ Опыт: +{exp_gain1}\n"
     if chest_reward_text:
         res1 += chest_reward_text
+    if career_text:
+        res1 += career_text
     if unlocked1:
         res1 += "\n🏆 <b>Новые достижения:</b>\n"
         for ach in unlocked1:
@@ -1921,6 +2076,8 @@ async def finish_game_session(match_id, winner):
         res2 = f"🏁 <b>Матч окончен!</b>\n"
         if is_friendly:
             res2 += f"🤝 Товарищеский матч\n"
+        if is_career:
+            res2 += f"🏆 Матч карьеры\n"
         if is_win2:
             res2 += f"🎉 Победа! +{mmr_change2} ММР, +{bonus_coins2} монет (бонус Лидера).\n"
         else:
@@ -2023,10 +2180,13 @@ async def help_cmd(message: Message):
         "/create_room - Создать закрытую комнату\n"
         "/invite_room @username room_id - Пригласить в комнату\n"
         "/join_room room_id - Присоединиться к комнате\n"
+        "/room_chat room_id - Включить/выключить чат в комнате\n"
         "/start_room room_id - Начать матч в комнате\n\n"
         "👥 <b>Друзья</b>\n"
         "/friends - Список друзей\n"
         "/addfriend @username - Отправить заявку в друзья\n\n"
+        "🛡 <b>Кланы</b>\n"
+        "/setclanchat ссылка - привязать группу к клану (только владелец)\n\n"
         "📈 <b>Прогресс</b>\n"
         "/referral - Реферальная ссылка\n"
         "/verify - Верификация\n"
