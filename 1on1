@@ -35,7 +35,7 @@ CLANS_DB = {}
 ACTIVE_MATCHES = {}
 MATCHMAKING_QUEUE = []
 IN_GAME_USERS = set()
-PRIVATE_ROOMS = {}  # {room_id: {creator, players, chat_enabled, ...}}
+PRIVATE_ROOMS = {}
 
 # ===== УНИВЕРСАЛЬНАЯ ПРОВЕРКА АДМИНА =====
 def is_admin(user: Union[User, dict, str, int]) -> bool:
@@ -323,20 +323,20 @@ def update_quests(user):
 
 def generate_daily_quests():
     pool = [
-        {"type": "play_pvp", "target": 1, "reward_coins": 50, "reward_xp": 10, "text": "Сыграть 1 PvP матч", "current": 0},
-        {"type": "play_pve", "target": 2, "reward_coins": 40, "reward_xp": 8, "text": "Сыграть 2 матча с ботом", "current": 0},
-        {"type": "win_any", "target": 1, "reward_coins": 60, "reward_xp": 12, "text": "Одержать 1 победу", "current": 0},
-        {"type": "score", "target": 3, "reward_coins": 55, "reward_xp": 10, "text": "Забить 3 гола", "current": 0},
-        {"type": "play_time", "target": 1, "reward_coins": 30, "reward_xp": 5, "text": "Сыграть 1 матч 'На время'", "current": 0},
+        {"type": "play_pvp", "target": 1, "reward_coins": 50, "reward_xp": 10, "text": "Сыграть 1 PvP матч", "current": 0, "completed": False},
+        {"type": "play_pve", "target": 2, "reward_coins": 40, "reward_xp": 8, "text": "Сыграть 2 матча с ботом", "current": 0, "completed": False},
+        {"type": "win_any", "target": 1, "reward_coins": 60, "reward_xp": 12, "text": "Одержать 1 победу", "current": 0, "completed": False},
+        {"type": "score", "target": 3, "reward_coins": 55, "reward_xp": 10, "text": "Забить 3 гола", "current": 0, "completed": False},
+        {"type": "play_time", "target": 1, "reward_coins": 30, "reward_xp": 5, "text": "Сыграть 1 матч 'На время'", "current": 0, "completed": False},
     ]
     return random.sample(pool, 3)
 
 def generate_weekly_quests():
     pool = [
-        {"type": "play_pvp", "target": 10, "reward_coins": 300, "reward_crystals": 10, "text": "Сыграть 10 PvP матчей", "current": 0},
-        {"type": "win_any", "target": 7, "reward_coins": 400, "reward_crystals": 15, "text": "Одержать 7 побед", "current": 0},
-        {"type": "score", "target": 20, "reward_coins": 350, "reward_crystals": 12, "text": "Забить 20 голов", "current": 0},
-        {"type": "streak", "target": 5, "reward_coins": 500, "reward_crystals": 20, "text": "Выиграть 5 матчей подряд", "current": 0},
+        {"type": "play_pvp", "target": 10, "reward_coins": 300, "reward_crystals": 10, "text": "Сыграть 10 PvP матчей", "current": 0, "completed": False},
+        {"type": "win_any", "target": 7, "reward_coins": 400, "reward_crystals": 15, "text": "Одержать 7 побед", "current": 0, "completed": False},
+        {"type": "score", "target": 20, "reward_coins": 350, "reward_crystals": 12, "text": "Забить 20 голов", "current": 0, "completed": False},
+        {"type": "streak", "target": 5, "reward_coins": 500, "reward_crystals": 20, "text": "Выиграть 5 матчей подряд", "current": 0, "completed": False},
     ]
     return random.sample(pool, 2)
 
@@ -879,13 +879,17 @@ async def quests_callback(callback: CallbackQuery):
     text += "🔹 <u>Ежедневные</u>:\n"
     for q in user.get("daily_quests", []):
         current = q.get("current", 0)
-        status = "✅" if current >= q["target"] else "⏳"
-        text += f"{status} {q['text']} ({current}/{q['target']})\n"
+        target = q["target"]
+        completed = q.get("completed", False)
+        status = "✅" if completed else ("⏳" if current >= target else "⬜")
+        text += f"{status} {q['text']} ({current}/{target})\n"
     text += "\n🔹 <u>Недельные</u>:\n"
     for q in user.get("weekly_quests", []):
         current = q.get("current", 0)
-        status = "✅" if current >= q["target"] else "⏳"
-        text += f"{status} {q['text']} ({current}/{q['target']})\n"
+        target = q["target"]
+        completed = q.get("completed", False)
+        status = "✅" if completed else ("⏳" if current >= target else "⬜")
+        text += f"{status} {q['text']} ({current}/{target})\n"
     await callback.message.edit_text(text, reply_markup=back_to_main_keyboard())
 
 @dp.callback_query(F.data == "settings")
@@ -1162,7 +1166,7 @@ async def handle_chest_actions(callback: CallbackQuery):
         await show_chests(callback)
 
 # ======================================================
-# ===== КЛАНЫ (с привязкой группы) =====
+# ===== КЛАНЫ (ДОБАВЛЕНА КНОПКА УДАЛЕНИЯ) =====
 # ======================================================
 
 @dp.callback_query(F.data == "menu_clan")
@@ -1205,8 +1209,47 @@ async def show_clan_menu(callback: CallbackQuery):
         ]
         if clan["owner"] == callback.from_user.id:
             kb.append([InlineKeyboardButton(text="🔗 Привязать группу", callback_data="clan_set_chat")])
+            kb.append([InlineKeyboardButton(text="🗑 Удалить клан", callback_data="clan_delete")])
         kb.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="to_main")])
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "clan_delete")
+async def clan_delete_confirm(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id)
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan or clan["owner"] != callback.from_user.id:
+        await callback.answer("❌ Только владелец может удалить клан.", show_alert=True)
+        return
+    text = (
+        f"⚠️ <b>Вы уверены, что хотите удалить клан '{clan['name']}'?</b>\n\n"
+        f"Это действие нельзя отменить. Все участники будут исключены, и клан исчезнет."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data="clan_delete_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_clan")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "clan_delete_confirm")
+async def clan_delete_execute(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id)
+    clan = CLANS_DB.get(user["clan_id"])
+    if not clan or clan["owner"] != callback.from_user.id:
+        await callback.answer("❌ Только владелец может удалить клан.", show_alert=True)
+        return
+    
+    # Удаляем клан из базы
+    cid = user["clan_id"]
+    del CLANS_DB[cid]
+    
+    # У всех участников сбрасываем clan_id
+    for uid in clan["members"]:
+        if uid in USERS_DB:
+            USERS_DB[uid]["clan_id"] = None
+    
+    save_db()
+    await callback.answer("✅ Клан удалён. Все участники исключены.", show_alert=True)
+    await back_to_main(callback)
 
 @dp.callback_query(F.data == "clan_set_chat")
 async def clan_set_chat(callback: CallbackQuery):
@@ -1255,11 +1298,6 @@ async def clan_chat(callback: CallbackQuery):
         await callback.answer("❌ Владелец клана ещё не привязал группу.", show_alert=True)
         return
     
-    # Проверяем, подписан ли пользователь на этот чат
-    # Если ссылка начинается с https://t.me/joinchat/... или https://t.me/+...
-    # Проще всего проверить, что пользователь является членом группы, если известен chat_id.
-    # Но так как мы не знаем chat_id, предлагаем просто дать ссылку.
-    # Можно дать ссылку и попросить вступить.
     text = (
         f"🗣 <b>Чат клана</b>\n\n"
         f"Для общения в чате клана вам необходимо вступить в группу:\n"
@@ -1275,21 +1313,8 @@ async def clan_chat(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "clan_chat_check")
 async def clan_chat_check(callback: CallbackQuery):
-    user = get_or_create_user(callback.from_user.id)
-    clan = CLANS_DB.get(user["clan_id"])
-    if not clan:
-        await callback.answer("❌ Вы не в клане.", show_alert=True)
-        return
-    chat_link = clan.get("chat_link")
-    if not chat_link:
-        await callback.answer("❌ Группа не привязана.", show_alert=True)
-        return
-    # Предлагаем просто дать ссылку, так как проверить членство без chat_id невозможно
     await callback.answer("✅ Для доступа к чату клана вступите в группу по ссылке.", show_alert=False)
-    # Можно было бы проверить, является ли пользователь участником группы, если известен её ID.
-    # Но для простоты оставляем так.
 
-# ===== ОСТАЛЬНЫЕ КЛАН-ХЕНДЛЕРЫ (без изменений) =====
 @dp.callback_query(F.data == "clan_create")
 async def create_clan_process(callback: CallbackQuery):
     user = get_or_create_user(callback.from_user.id, callback.from_user.username)
@@ -1307,6 +1332,7 @@ async def create_clan_process(callback: CallbackQuery):
         "chat_link": None
     }
     user["clan_id"] = clan_id
+    save_db()
     await callback.answer(f"🎉 Клан '{clan_name}' успешно создан!")
     await show_clan_menu(callback)
 
@@ -1337,6 +1363,7 @@ async def join_clan_handler(callback: CallbackQuery):
     if callback.from_user.id not in CLANS_DB[cid]["members"]:
         CLANS_DB[cid]["members"].append(callback.from_user.id)
     await update_clan_cups(cid)
+    save_db()
     await callback.answer("🎉 Вы успешно вступили в клуб!")
     await show_clan_menu(callback)
 
@@ -1352,10 +1379,14 @@ async def leave_clan_handler(callback: CallbackQuery):
         else:
             await update_clan_cups(cid)
     user["clan_id"] = None
+    save_db()
     await callback.answer("Вы покинули клан.")
     await show_clan_menu(callback)
 
-# ===== БАТЛ-ПАСС (VIP) =====
+# ======================================================
+# ===== БАТЛ-ПАСС =====
+# ======================================================
+
 @dp.callback_query(F.data == "menu_bp")
 async def show_battle_pass(callback: CallbackQuery):
     user = get_or_create_user(callback.from_user.id, callback.from_user.username)
@@ -1504,7 +1535,7 @@ async def friends_cmd(message: Message):
     await message.answer(text)
 
 # ======================================================
-# ===== ЗАКРЫТЫЕ КОМНАТЫ (с чатом) =====
+# ===== ЗАКРЫТЫЕ КОМНАТЫ =====
 # ======================================================
 
 @dp.message(Command("create_room"))
@@ -1549,19 +1580,15 @@ async def room_chat_cmd(message: Message):
     room["chat_enabled"] = not room.get("chat_enabled", False)
     status = "включён" if room["chat_enabled"] else "выключен"
     await message.answer(f"💬 Чат в комнате {status}.\nТеперь сообщения будут пересылаться между участниками комнаты.")
-    # Если чат включён, будем пересылать сообщения
     if room["chat_enabled"]:
-        # Запоминаем, что чат активен для данного пользователя
         room["chat_active"] = True
     else:
         room["chat_active"] = False
 
 @dp.message(F.text & ~F.text.startswith('/'))
 async def room_chat_message_handler(message: Message):
-    # Проверяем, является ли пользователь участником какой-либо активной комнаты с включённым чатом
     for room_id, room in PRIVATE_ROOMS.items():
         if message.from_user.id in room["players"] and room.get("chat_enabled", False):
-            # Пересылаем сообщение всем участникам комнаты, кроме отправителя
             for player in room["players"]:
                 if player != message.from_user.id:
                     try:
@@ -1666,7 +1693,6 @@ async def start_room_cmd(message: Message):
         return
     p1 = room["players"][0]
     p2 = room["players"][1]
-    # Удаляем комнату после начала матча
     del PRIVATE_ROOMS[room_id]
     await bot.send_message(p1, "🏟 <b>Товарищеский матч начинается!</b>\n\nПротивник: 👤 " + USERS_DB[p2]["username"])
     await bot.send_message(p2, "🏟 <b>Товарищеский матч начинается!</b>\n\nПротивник: 👤 " + USERS_DB[p1]["username"])
@@ -1674,7 +1700,7 @@ async def start_room_cmd(message: Message):
     asyncio.create_task(init_game_session(p1, p2, match_type="friendly"))
 
 # ======================================================
-# ===== СИСТЕМА МАТЧЕЙ (с сохранением карьеры) =====
+# ===== СИСТЕМА МАТЧЕЙ =====
 # ======================================================
 
 async def send_safely(user_id, text, reply_markup=None):
@@ -1793,6 +1819,7 @@ async def start_tourney_match(callback: CallbackQuery):
     await callback.message.edit_text(f"🥇 Выход на поле (Этап турнира {user['tourney_wins'] + 1}/3)...")
     asyncio.create_task(init_game_session(user_id, "ai_bot", match_type="tourney"))
 
+# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ТАЙМАУТОМ =====
 async def init_game_session(p1, p2, match_type="pvp"):
     u1 = USERS_DB[p1]
     is_bot = (p2 == "ai_bot")
@@ -1817,7 +1844,9 @@ async def init_game_session(p1, p2, match_type="pvp"):
         "score": {p1: 0, p2: 0}, "round": 1, "stage": "atk_choosing",
         "attacker": p1, "defender": p2, "atk_choice": None,
         "ult_used": {p1: False, p2: False if is_bot else False},
-        "messages": {p1: msg1.message_id if msg1 else None, p2: msg2.message_id if msg2 else None}
+        "messages": {p1: msg1.message_id if msg1 else None, p2: msg2.message_id if msg2 else None},
+        "last_action_time": time.time(),
+        "player_responded": False
     }
     await asyncio.sleep(1.5)
     await execute_match_turn(match_id)
@@ -1828,6 +1857,9 @@ async def execute_match_turn(match_id):
         return
     atk, dfn = m["attacker"], m["defender"]
     r = m["round"]
+    m["last_action_time"] = time.time()
+    m["player_responded"] = False
+    
     if m["is_bot"] and atk == "ai_bot":
         m["atk_choice"] = random.choice(["left", "center", "right"])
         if not m["ult_used"]["ai_bot"] and random.random() < 0.3:
@@ -1836,6 +1868,7 @@ async def execute_match_turn(match_id):
         m["stage"] = "def_guessing"
         def_text = f"<b>Раунд {r}</b>\n\n🤖 Противник нанес скрытый удар! Куда прыгаем?"
         await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text, reply_markup=game_choice_keyboard(match_id, "def", not m["ult_used"][dfn]))
+        asyncio.create_task(check_timeout(match_id, dfn))
         return
     atk_text = f"<b>Раунд {r}</b>\n\n🔥 Ваша <b>АТАКУЮЩАЯ</b> очередь. Куда пробьем?"
     try:
@@ -1848,6 +1881,17 @@ async def execute_match_turn(match_id):
             await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text)
         except Exception:
             pass
+    asyncio.create_task(check_timeout(match_id, atk))
+
+async def check_timeout(match_id, player_id):
+    await asyncio.sleep(15)
+    m = ACTIVE_MATCHES.get(match_id)
+    if not m or m.get("stage") == "finished":
+        return
+    if m.get("player_responded", False):
+        return
+    winner = m["p1"] if m["p1"] != player_id else m["p2"]
+    await finish_game_session(match_id, winner, forfeit=True)
 
 @dp.callback_query(F.data.startswith("game:"))
 async def process_game_callbacks(callback: CallbackQuery):
@@ -1856,6 +1900,7 @@ async def process_game_callbacks(callback: CallbackQuery):
     m = ACTIVE_MATCHES.get(match_id)
     if not m:
         return await callback.answer("Матч завершен.", show_alert=True)
+    m["player_responded"] = True
     
     if m.get("match_type") == "timeattack":
         uid = callback.from_user.id
@@ -1931,6 +1976,7 @@ async def process_game_callbacks(callback: CallbackQuery):
         else:
             def_text = f"<b>Раунд {m['round']}</b>\n\n⚡ Нападающий бьет! Твой прыжок:"
             await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text, reply_markup=game_choice_keyboard(match_id, "def", not m["ult_used"][dfn]))
+            asyncio.create_task(check_timeout(match_id, dfn))
     elif role == "def" and m["stage"] == "def_guessing" and uid == dfn:
         if choice == "ult":
             m["ult_used"][dfn] = True
@@ -1953,15 +1999,17 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
         wall_level = USERS_DB[m["defender"]]["skills"].get("wall", 0)
     wall_bonus = wall_level * 0.005
     
+    defender_name = USERS_DB[m["defender"]]["username"] if not m["is_bot"] else m["p2_name"]
+    
     if atk_choice == "ult" and def_choice == "center":
         is_goal = False
-        details = "💥 Крученый удар отражен по центру железными руками вратаря!"
+        details = f"💥 Крученый удар отражен по центру железными руками {defender_name}!"
     elif atk_choice == "ult":
         is_goal = True
         details = "🔥 Крученый удар! Мяч поменял траекторию и вонзился в сетку!"
     elif def_choice == "ult":
         is_goal = False
-        details = "🐆 Прыжок пантеры! Голкипер закрыл всю площадь ворот!"
+        details = f"🐆 Прыжок пантеры! {defender_name} закрыл всю площадь ворот!"
     else:
         if atk_choice == def_choice:
             if not m["is_bot"]:
@@ -1973,17 +2021,18 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
                     details = "💥 Вратарь угадал, но АТАКА была слишком мощной — мяч прошил руки!"
                 else:
                     is_goal = False
-                    details = f"🧤 СЕЙВ! Вратарь берет мяч в углу: {get_dir_name(def_choice)}"
+                    details = f"🧤 СЕЙВ! {defender_name} берет мяч в углу: {get_dir_name(def_choice)}"
             else:
                 is_goal = False
-                details = "🧤 Противник совершает уверенный сейв!"
+                details = f"🧤 СЕЙВ! {defender_name} совершает уверенный сейв!"
         else:
             is_goal = True
-            details = f"🔥 ГОЛ! Мяч улетел в {get_dir_name(atk_choice)}, а кипер прыгнул в {get_dir_name(def_choice)}"
+            details = f"🔥 ГОЛ! Мяч улетел в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
     if is_goal:
         m["score"][m["attacker"]] += 1
     res_msg = f"{details}\n\n📊 Счет: {m['p1_name']} [{m['score'][p1]}] : [{m['score'][p2]}] {m['p2_name']}"
     m["round"] += 1
+    m["player_responded"] = False
     if m["round"] > 6 and m['score'][p1] != m['score'][p2]:
         winner = p1 if m["score"][p1] > m["score"][p2] else p2
         await finish_game_session(match_id, winner)
@@ -1997,10 +2046,11 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
         await asyncio.sleep(2)
         await execute_match_turn(match_id)
 
-async def finish_game_session(match_id, winner):
+async def finish_game_session(match_id, winner, forfeit=False):
     m = ACTIVE_MATCHES.get(match_id)
     if not m:
         return
+    m["stage"] = "finished"
     p1, p2 = m["p1"], m["p2"]
     u1 = USERS_DB[p1]
     is_win1 = (p1 == winner)
@@ -2008,7 +2058,6 @@ async def finish_game_session(match_id, winner):
     is_career = (m["match_type"] == "career")
     
     mmr_change1 = 0
-    mmr_change2 = 0
     if not is_friendly:
         opponent = USERS_DB[p2] if not m["is_bot"] else {"mmr": 0, "username": "бот"}
         mmr_change1 = calculate_mmr_change(u1, opponent, "win" if is_win1 else "loss", m["score"][p1], m["score"][p2])
@@ -2029,18 +2078,18 @@ async def finish_game_session(match_id, winner):
         else:
             chest_reward_text = "\n⚠️ У вас нет свободных слотов для сундука. Откройте один из существующих."
 
-    # Карьера: увеличиваем этап при победе
     career_text = ""
     if is_career and is_win1:
         u1["career_stage"] += 1
         career_text = f"\n📈 Этап карьеры повышен до {u1['career_stage']}!"
-        save_db()  # сохраняем сразу
 
     res1 = f"🏁 <b>Матч окончен!</b>\n"
     if is_friendly:
         res1 += f"🤝 Товарищеский матч\n"
     if is_career:
         res1 += f"🏆 Матч карьеры\n"
+    if forfeit:
+        res1 += f"⏰ Техническое поражение (неответ)\n"
     if is_win1:
         res1 += f"🎉 Победа! +{mmr_change1} ММР, +{bonus_coins} монет (бонус Лидера).\n"
     else:
@@ -2078,6 +2127,8 @@ async def finish_game_session(match_id, winner):
             res2 += f"🤝 Товарищеский матч\n"
         if is_career:
             res2 += f"🏆 Матч карьеры\n"
+        if forfeit:
+            res2 += f"⏰ Техническое поражение (неответ)\n"
         if is_win2:
             res2 += f"🎉 Победа! +{mmr_change2} ММР, +{bonus_coins2} монет (бонус Лидера).\n"
         else:
@@ -2140,28 +2191,30 @@ async def update_stats_and_quests(user, result, goals_scored, goals_conceded, mm
 
 def check_quests_by_type(user, quest_type, amount):
     for q in user.get("daily_quests", []):
-        if q.get("type") == quest_type:
+        if q.get("type") == quest_type and not q.get("completed", False):
             q["current"] = q.get("current", 0) + amount
+            if q["current"] >= q["target"]:
+                q["completed"] = True
+                user["coins"] += q.get("reward_coins", 0)
+                user["crystals"] += q.get("reward_crystals", 0)
+                if "reward_xp" in q:
+                    add_exp(user, q["reward_xp"])
     for q in user.get("weekly_quests", []):
-        if q.get("type") == quest_type:
+        if q.get("type") == quest_type and not q.get("completed", False):
             q["current"] = q.get("current", 0) + amount
+            if q["current"] >= q["target"]:
+                q["completed"] = True
+                user["coins"] += q.get("reward_coins", 0)
+                user["crystals"] += q.get("reward_crystals", 0)
 
 def check_quest_completion(user):
     daily_done = False
     for q in user.get("daily_quests", []):
-        if q.get("current", 0) >= q["target"]:
-            user["coins"] += q.get("reward_coins", 0)
-            user["crystals"] += q.get("reward_crystals", 0)
-            if "reward_xp" in q:
-                add_exp(user, q["reward_xp"])
-            q["current"] = 0
+        if q.get("completed", False):
             daily_done = True
     weekly_done = False
     for q in user.get("weekly_quests", []):
-        if q.get("current", 0) >= q["target"]:
-            user["coins"] += q.get("reward_coins", 0)
-            user["crystals"] += q.get("reward_crystals", 0)
-            q["current"] = 0
+        if q.get("completed", False):
             weekly_done = True
     return daily_done, weekly_done
 
@@ -2226,6 +2279,7 @@ async def time_attack_cmd(message: Message):
         "messages": {message.from_user.id: None},
         "time_start": time.time(),
         "time_limit": 90,
+        "player_responded": False
     }
     await bot.send_message(
         message.from_user.id,
