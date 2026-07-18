@@ -1716,7 +1716,7 @@ async def start_room_cmd(message: Message):
     asyncio.create_task(init_game_session(p1, p2, match_type="friendly"))
 
 # ======================================================
-# ===== СИСТЕМА МАТЧЕЙ (15 СЕКУНД ТАЙМАУТ) =====
+# ===== СИСТЕМА МАТЧЕЙ (15 СЕКУНД ТАЙМАУТ НА КАЖДЫЙ ХОД) =====
 # ======================================================
 
 async def send_safely(user_id, text, reply_markup=None):
@@ -1835,7 +1835,7 @@ async def start_tourney_match(callback: CallbackQuery):
     await callback.message.edit_text(f"🥇 Выход на поле (Этап турнира {user['tourney_wins'] + 1}/3)...")
     asyncio.create_task(init_game_session(user_id, "ai_bot", match_type="tourney"))
 
-# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ТАЙМАУТОМ 15 СЕКУНД =====
+# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ТАЙМАУТОМ 15 СЕКУНД НА ХОД =====
 async def init_game_session(p1, p2, match_type="pvp"):
     u1 = USERS_DB[p1]
     is_bot = (p2 == "ai_bot")
@@ -1862,8 +1862,7 @@ async def init_game_session(p1, p2, match_type="pvp"):
         "ult_used": {p1: False, p2: False if is_bot else False},
         "messages": {p1: msg1.message_id if msg1 else None, p2: msg2.message_id if msg2 else None},
         "last_action_time": time.time(),
-        "player_responded": False,
-        "timeout_started": False
+        "player_responded": False
     }
     await asyncio.sleep(1.5)
     await execute_match_turn(match_id)
@@ -1876,7 +1875,6 @@ async def execute_match_turn(match_id):
     r = m["round"]
     m["last_action_time"] = time.time()
     m["player_responded"] = False
-    m["timeout_started"] = False
     
     if m["is_bot"] and atk == "ai_bot":
         m["atk_choice"] = random.choice(["left", "center", "right"])
@@ -1902,16 +1900,46 @@ async def execute_match_turn(match_id):
     asyncio.create_task(check_timeout(match_id, atk))
 
 async def check_timeout(match_id, player_id):
-    """15 секунд таймаут - техническое поражение"""
+    """15 секунд на ответ. Если игрок не ответил - засчитываем гол или передаём ход"""
     await asyncio.sleep(15)
     m = ACTIVE_MATCHES.get(match_id)
     if not m or m.get("stage") == "finished":
         return
     if m.get("player_responded", False):
         return
-    # Объявляем техническое поражение
-    winner = m["p1"] if m["p1"] != player_id else m["p2"]
-    await finish_game_session(match_id, winner, forfeit=True)
+    
+    # Игрок не ответил
+    if m["stage"] == "def_guessing" and m["defender"] == player_id:
+        # Защитник не ответил - гол
+        attacker = m["attacker"]
+        m["score"][attacker] += 1
+        details = f"⏰ {USERS_DB[attacker]['username']} забивает гол! {USERS_DB[player_id]['username']} не ответил за 15 секунд."
+        await bot.send_message(m["p1"], f"⚽ {details}")
+        if not m["is_bot"]:
+            await bot.send_message(m["p2"], f"⚽ {details}")
+        m["round"] += 1
+        m["player_responded"] = False
+        if m["round"] > 6 and m['score'][m["p1"]] != m['score'][m["p2"]]:
+            winner = m["p1"] if m["score"][m["p1"]] > m["score"][m["p2"]] else m["p2"]
+            await finish_game_session(match_id, winner)
+        else:
+            m["attacker"], m["defender"] = m["defender"], m["attacker"]
+            m["stage"] = "atk_choosing"
+            m["atk_choice"] = None
+            await asyncio.sleep(1)
+            await execute_match_turn(match_id)
+    elif m["stage"] == "atk_choosing" and m["attacker"] == player_id:
+        # Атакующий не ответил - ход переходит сопернику
+        details = f"⏰ {USERS_DB[player_id]['username']} не ответил за 15 секунд! Ход переходит сопернику."
+        await bot.send_message(m["p1"], f"⏰ {details}")
+        if not m["is_bot"]:
+            await bot.send_message(m["p2"], f"⏰ {details}")
+        m["attacker"], m["defender"] = m["defender"], m["attacker"]
+        m["stage"] = "atk_choosing"
+        m["atk_choice"] = None
+        m["player_responded"] = False
+        await asyncio.sleep(1)
+        await execute_match_turn(match_id)
 
 @dp.callback_query(F.data.startswith("game:"))
 async def process_game_callbacks(callback: CallbackQuery):
@@ -2513,7 +2541,6 @@ async def backup_task():
 
 # ===== ЗАПУСК =====
 async def main():
-    # Создаём папку для базы данных (если её нет)
     os.makedirs("data", exist_ok=True)
     load_db()
     asyncio.create_task(db_autosave_task())
