@@ -1184,12 +1184,18 @@ async def handle_chest_actions(callback: CallbackQuery):
         await show_chests(callback)
 
 # ======================================================
-# ===== КЛАНЫ =====
+# ===== КЛАНЫ (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====
 # ======================================================
 
 @dp.callback_query(F.data == "menu_clan")
 async def show_clan_menu(callback: CallbackQuery):
     user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    
+    # Проверяем, существует ли клан, на который ссылается пользователь
+    if user["clan_id"] is not None and user["clan_id"] not in CLANS_DB:
+        user["clan_id"] = None
+        save_db()
+    
     if user["clan_id"] is None:
         text = (
             "🛡 <b>Футбольные Кланы</b>\n\nВы еще не состоите в клане. Объединяйтесь с друзьями, "
@@ -1206,7 +1212,9 @@ async def show_clan_menu(callback: CallbackQuery):
         clan = CLANS_DB.get(user["clan_id"])
         if not clan:
             user["clan_id"] = None
+            save_db()
             return await show_clan_menu(callback)
+        
         await update_clan_cups(user["clan_id"])
         
         chat_info = ""
@@ -1257,15 +1265,136 @@ async def clan_delete_execute(callback: CallbackQuery):
         return
     
     cid = user["clan_id"]
+    members = clan["members"].copy()
+    
+    # Удаляем клан
     del CLANS_DB[cid]
     
-    for uid in clan["members"]:
+    # У всех участников сбрасываем clan_id
+    for uid in members:
         if uid in USERS_DB:
             USERS_DB[uid]["clan_id"] = None
+    
+    # У самого создателя тоже сбрасываем
+    user["clan_id"] = None
     
     save_db()
     await callback.answer("✅ Клан удалён. Все участники исключены.", show_alert=True)
     await back_to_main(callback)
+
+@dp.callback_query(F.data == "clan_create")
+async def create_clan_process(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    
+    # Проверяем, не состоит ли пользователь уже в клане
+    if user["clan_id"] is not None:
+        # Проверяем, существует ли клан
+        if user["clan_id"] in CLANS_DB:
+            await callback.answer("❌ Вы уже состоите в клане!", show_alert=True)
+            return
+        else:
+            # Если клан не существует, сбрасываем ID
+            user["clan_id"] = None
+            save_db()
+    
+    if user["coins"] < 500:
+        await callback.answer("❌ Недостаточно монет для создания клана (нужно 500)!", show_alert=True)
+        return
+    
+    user["coins"] -= 500
+    # Генерируем уникальный ID
+    clan_id = f"c_{random.randint(100, 999)}_{int(time.time())}"
+    clan_name = f"ФК {user['username']}"
+    CLANS_DB[clan_id] = {
+        "name": clan_name,
+        "owner": callback.from_user.id,
+        "cups": user["mmr"],
+        "members": [callback.from_user.id],
+        "chat_link": None
+    }
+    user["clan_id"] = clan_id
+    save_db()
+    await callback.answer(f"🎉 Клан '{clan_name}' успешно создан!", show_alert=True)
+    await show_clan_menu(callback)
+
+@dp.callback_query(F.data == "clan_list")
+async def show_clan_list(callback: CallbackQuery):
+    text = "📜 <b>Доступные футбольные кланы:</b>\n\n"
+    kb = []
+    if not CLANS_DB:
+        text += "Пока не создано ни одного клана."
+    else:
+        for cid, info in CLANS_DB.items():
+            text += f"🔹 <b>{info['name']}</b> | 🏆 ММР: {info.get('cups', 0)} ({len(info['members'])}/15)\n"
+            kb.append([InlineKeyboardButton(text=f"🤝 Вступить в {info['name']}", callback_data=f"clan_join_{cid}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_clan")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("clan_join_"))
+async def join_clan_handler(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    cid = callback.data.split("_")[2]
+    
+    if cid not in CLANS_DB:
+        await callback.answer("❌ Клан не найден или был удалён.", show_alert=True)
+        return
+    
+    # Проверяем, не состоит ли пользователь уже в другом клане
+    if user["clan_id"] is not None:
+        if user["clan_id"] in CLANS_DB:
+            await callback.answer("❌ Вы уже состоите в другом клане! Сначала покиньте его.", show_alert=True)
+            return
+        else:
+            user["clan_id"] = None
+            save_db()
+    
+    if len(CLANS_DB[cid]["members"]) >= 15:
+        await callback.answer("❌ В клане нет мест!", show_alert=True)
+        return
+    
+    user["clan_id"] = cid
+    if callback.from_user.id not in CLANS_DB[cid]["members"]:
+        CLANS_DB[cid]["members"].append(callback.from_user.id)
+    
+    await update_clan_cups(cid)
+    save_db()
+    await callback.answer("🎉 Вы успешно вступили в клуб!", show_alert=True)
+    await show_clan_menu(callback)
+
+@dp.callback_query(F.data == "clan_leave")
+async def leave_clan_handler(callback: CallbackQuery):
+    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
+    cid = user["clan_id"]
+    
+    if cid is None or cid not in CLANS_DB:
+        user["clan_id"] = None
+        save_db()
+        await callback.answer("Вы не состоите в клане.", show_alert=True)
+        await show_clan_menu(callback)
+        return
+    
+    clan = CLANS_DB[cid]
+    
+    # Если пользователь владелец — удаляем весь клан
+    if clan["owner"] == callback.from_user.id:
+        members = clan["members"].copy()
+        del CLANS_DB[cid]
+        for uid in members:
+            if uid in USERS_DB:
+                USERS_DB[uid]["clan_id"] = None
+        user["clan_id"] = None
+        save_db()
+        await callback.answer("👑 Вы были владельцем. Клан удалён.", show_alert=True)
+    else:
+        # Просто выходим
+        if callback.from_user.id in clan["members"]:
+            clan["members"].remove(callback.from_user.id)
+        user["clan_id"] = None
+        await update_clan_cups(cid)
+        save_db()
+        await callback.answer("Вы покинули клан.", show_alert=True)
+    
+    await show_clan_menu(callback)
 
 @dp.callback_query(F.data == "clan_set_chat")
 async def clan_set_chat(callback: CallbackQuery):
@@ -1285,11 +1414,11 @@ async def clan_set_chat(callback: CallbackQuery):
 @dp.message(Command("setclanchat"))
 async def set_clan_chat_cmd(message: Message):
     user = get_or_create_user(message.from_user.id)
-    if user["clan_id"] is None:
-        await message.answer("❌ Вы не состоите в клане.")
+    if user["clan_id"] is None or user["clan_id"] not in CLANS_DB:
+        await message.answer("❌ Вы не состоите в клане или клан не существует.")
         return
-    clan = CLANS_DB.get(user["clan_id"])
-    if not clan or clan["owner"] != message.from_user.id:
+    clan = CLANS_DB[user["clan_id"]]
+    if clan["owner"] != message.from_user.id:
         await message.answer("❌ Только владелец клана может установить ссылку.")
         return
     args = message.text.split(maxsplit=1)
@@ -1299,7 +1428,7 @@ async def set_clan_chat_cmd(message: Message):
     link = args[1]
     clan["chat_link"] = link
     save_db()
-    await message.answer(f"✅ Ссылка на группу установлена: {link}\nТеперь участники клана должны быть подписаны на эту группу для общения в чате.")
+    await message.answer(f"✅ Ссылка на группу установлена: {link}")
 
 @dp.callback_query(F.data == "clan_chat")
 async def clan_chat(callback: CallbackQuery):
@@ -1330,74 +1459,6 @@ async def clan_chat(callback: CallbackQuery):
 @dp.callback_query(F.data == "clan_chat_check")
 async def clan_chat_check(callback: CallbackQuery):
     await callback.answer("✅ Для доступа к чату клана вступите в группу по ссылке.", show_alert=False)
-
-@dp.callback_query(F.data == "clan_create")
-async def create_clan_process(callback: CallbackQuery):
-    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
-    if user["coins"] < 500:
-        await callback.answer("❌ Недостаточно монет для создания клана (нужно 500)!", show_alert=True)
-        return
-    user["coins"] -= 500
-    clan_id = f"c_{random.randint(100, 999)}"
-    clan_name = f"ФК {user['username']}"
-    CLANS_DB[clan_id] = {
-        "name": clan_name,
-        "owner": callback.from_user.id,
-        "cups": user["mmr"],
-        "members": [callback.from_user.id],
-        "chat_link": None
-    }
-    user["clan_id"] = clan_id
-    save_db()
-    await callback.answer(f"🎉 Клан '{clan_name}' успешно создан!")
-    await show_clan_menu(callback)
-
-@dp.callback_query(F.data == "clan_list")
-async def show_clan_list(callback: CallbackQuery):
-    text = "📜 <b>Доступные футбольные кланы:</b>\n\n"
-    kb = []
-    if not CLANS_DB:
-        text += "Пока не создано ни одного клана."
-    else:
-        for cid, info in CLANS_DB.items():
-            text += f"🔹 <b>{info['name']}</b> | 🏆 ММР: {info.get('cups', 0)} ({len(info['members'])}/15)\n"
-            kb.append([InlineKeyboardButton(text=f"🤝 Вступить в {info['name']}", callback_data=f"clan_join_{cid}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_clan")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@dp.callback_query(F.data.startswith("clan_join_"))
-async def join_clan_handler(callback: CallbackQuery):
-    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
-    cid = callback.data.split("_")[2]
-    if cid not in CLANS_DB:
-        await callback.answer("Клан распущен.", show_alert=True)
-        return
-    if len(CLANS_DB[cid]["members"]) >= 15:
-        await callback.answer("❌ В клане нет мест!", show_alert=True)
-        return
-    user["clan_id"] = cid
-    if callback.from_user.id not in CLANS_DB[cid]["members"]:
-        CLANS_DB[cid]["members"].append(callback.from_user.id)
-    await update_clan_cups(cid)
-    save_db()
-    await callback.answer("🎉 Вы успешно вступили в клуб!")
-    await show_clan_menu(callback)
-
-@dp.callback_query(F.data == "clan_leave")
-async def leave_clan_handler(callback: CallbackQuery):
-    user = get_or_create_user(callback.from_user.id, callback.from_user.username)
-    cid = user["clan_id"]
-    if cid in CLANS_DB:
-        if callback.from_user.id in CLANS_DB[cid]["members"]:
-            CLANS_DB[cid]["members"].remove(callback.from_user.id)
-        if CLANS_DB[cid]["owner"] == callback.from_user.id or not CLANS_DB[cid]["members"]:
-            del CLANS_DB[cid]
-        else:
-            await update_clan_cups(cid)
-    user["clan_id"] = None
-    save_db()
-    await callback.answer("Вы покинули клан.")
-    await show_clan_menu(callback)
 
 # ======================================================
 # ===== БАТЛ-ПАСС =====
@@ -1716,7 +1777,7 @@ async def start_room_cmd(message: Message):
     asyncio.create_task(init_game_session(p1, p2, match_type="friendly"))
 
 # ======================================================
-# ===== СИСТЕМА МАТЧЕЙ (ИСПРАВЛЕННАЯ) =====
+# ===== СИСТЕМА МАТЧЕЙ =====
 # ======================================================
 
 async def send_safely(user_id, text, reply_markup=None):
