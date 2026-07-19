@@ -1716,7 +1716,7 @@ async def start_room_cmd(message: Message):
     asyncio.create_task(init_game_session(p1, p2, match_type="friendly"))
 
 # ======================================================
-# ===== СИСТЕМА МАТЧЕЙ (15 СЕКУНД ТАЙМАУТ НА КАЖДЫЙ ХОД) =====
+# ===== СИСТЕМА МАТЧЕЙ (ИСПРАВЛЕННАЯ) =====
 # ======================================================
 
 async def send_safely(user_id, text, reply_markup=None):
@@ -1835,7 +1835,7 @@ async def start_tourney_match(callback: CallbackQuery):
     await callback.message.edit_text(f"🥇 Выход на поле (Этап турнира {user['tourney_wins'] + 1}/3)...")
     asyncio.create_task(init_game_session(user_id, "ai_bot", match_type="tourney"))
 
-# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ТАЙМАУТОМ 15 СЕКУНД НА ХОД =====
+# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ТАЙМАУТОМ 15 СЕКУНД =====
 async def init_game_session(p1, p2, match_type="pvp"):
     u1 = USERS_DB[p1]
     is_bot = (p2 == "ai_bot")
@@ -1908,11 +1908,12 @@ async def check_timeout(match_id, player_id):
     if m.get("player_responded", False):
         return
     
-    # Игрок не ответил
-    if m["stage"] == "def_guessing" and m["defender"] == player_id:
-        # Защитник не ответил - гол
-        attacker = m["attacker"]
-        m["score"][attacker] += 1
+    defender = m["defender"]
+    attacker = m["attacker"]
+    
+    if m["stage"] == "def_guessing" and defender == player_id:
+        # Защитник не ответил - гол атакующему
+        m["score"][attacker] = m["score"].get(attacker, 0) + 1
         details = f"⏰ {USERS_DB[attacker]['username']} забивает гол! {USERS_DB[player_id]['username']} не ответил за 15 секунд."
         await bot.send_message(m["p1"], f"⚽ {details}")
         if not m["is_bot"]:
@@ -1928,8 +1929,8 @@ async def check_timeout(match_id, player_id):
             m["atk_choice"] = None
             await asyncio.sleep(1)
             await execute_match_turn(match_id)
-    elif m["stage"] == "atk_choosing" and m["attacker"] == player_id:
-        # Атакующий не ответил - ход переходит сопернику
+    elif m["stage"] == "atk_choosing" and attacker == player_id:
+        # Атакующий не ответил - ход переходит сопернику (без гола)
         details = f"⏰ {USERS_DB[player_id]['username']} не ответил за 15 секунд! Ход переходит сопернику."
         await bot.send_message(m["p1"], f"⏰ {details}")
         if not m["is_bot"]:
@@ -2047,26 +2048,29 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
         wall_level = USERS_DB[m["defender"]]["skills"].get("wall", 0)
     wall_bonus = wall_level * 0.005
     
-    defender_name = USERS_DB[m["defender"]]["username"] if not m["is_bot"] else m["p2_name"]
+    attacker = m["attacker"]
+    defender = m["defender"]
+    defender_name = USERS_DB[defender]["username"] if not m["is_bot"] else m["p2_name"]
+    attacker_name = USERS_DB[attacker]["username"] if not m["is_bot"] else m["p1_name"]
     
     if atk_choice == "ult" and def_choice == "center":
         is_goal = False
         details = f"💥 Крученый удар отражен по центру железными руками {defender_name}!"
     elif atk_choice == "ult":
         is_goal = True
-        details = "🔥 Крученый удар! Мяч поменял траекторию и вонзился в сетку!"
+        details = f"🔥 Крученый удар от {attacker_name}! Мяч поменял траекторию и вонзился в сетку!"
     elif def_choice == "ult":
         is_goal = False
         details = f"🐆 Прыжок пантеры! {defender_name} закрыл всю площадь ворот!"
     else:
         if atk_choice == def_choice:
             if not m["is_bot"]:
-                a_atk, _ = get_effective_stats(USERS_DB[m["attacker"]])
-                _, d_dfn = get_effective_stats(USERS_DB[m["defender"]])
+                a_atk, _ = get_effective_stats(USERS_DB[attacker])
+                _, d_dfn = get_effective_stats(USERS_DB[defender])
                 breakthrough_chance = max(0.05, 0.3 - wall_bonus)
                 if a_atk > d_dfn + 40 and random.random() < breakthrough_chance:
                     is_goal = True
-                    details = "💥 Вратарь угадал, но АТАКА была слишком мощной — мяч прошил руки!"
+                    details = f"💥 {defender_name} угадал направление, но АТАКА {attacker_name} была слишком мощной — мяч прошил руки!"
                 else:
                     is_goal = False
                     details = f"🧤 СЕЙВ! {defender_name} берет мяч в углу: {get_dir_name(def_choice)}"
@@ -2075,9 +2079,12 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
                 details = f"🧤 СЕЙВ! {defender_name} совершает уверенный сейв!"
         else:
             is_goal = True
-            details = f"🔥 ГОЛ! Мяч улетел в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
+            details = f"🔥 ГОЛ! {attacker_name} пробил в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
+    
+    # ГОЛ ЗАСЧИТЫВАЕТСЯ ТОЛЬКО АТАКУЮЩЕМУ
     if is_goal:
-        m["score"][m["attacker"]] += 1
+        m["score"][attacker] = m["score"].get(attacker, 0) + 1
+    
     res_msg = f"{details}\n\n📊 Счет: {m['p1_name']} [{m['score'][p1]}] : [{m['score'][p2]}] {m['p2_name']}"
     m["round"] += 1
     m["player_responded"] = False
