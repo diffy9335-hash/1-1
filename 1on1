@@ -1937,6 +1937,7 @@ async def check_timeout(match_id, player_id):
     if m["stage"] == "def_guessing" and defender == player_id:
         # Защитник не ответил - гол атакующему
         attacker_id = attacker
+        
         if attacker_id != "ai_bot":
             attacker_name = USERS_DB[attacker_id]["username"]
         else:
@@ -1947,12 +1948,11 @@ async def check_timeout(match_id, player_id):
         else:
             defender_name = m["p2_name"] if p2 == "ai_bot" else m["p1_name"]
         
-        # Засчитываем гол атакующему (если атакует не бот)
+        # ЗАСЧИТЫВАЕМ ГОЛ ИГРОКУ, А НЕ БОТУ
         if attacker_id != "ai_bot":
             m["score"][attacker_id] = m["score"].get(attacker_id, 0) + 1
         else:
-            # Если атакует бот - гол засчитывается игроку, который в защите
-            # Но такого быть не должно, так как бот всегда в защите, когда игрок атакует
+            # Если атакует бот (редкий случай) - гол игроку в защите
             if p1 != "ai_bot":
                 m["score"][p1] = m["score"].get(p1, 0) + 1
             else:
@@ -2171,10 +2171,459 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
         await asyncio.sleep(2)
         await execute_match_turn(match_id)
 
-# ===== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) =====
-# ... (здесь идёт всё остальное: finish_game_session, update_stats_and_quests, 
-# check_quests_by_type, check_quest_completion, команды help/timeattack/referral/verify/notifications,
-# админ-команды export/add_coins/give_crystal/ban/reset_tourney/send_all, backup_task, main)
+async def finish_game_session(match_id, winner, forfeit=False):
+    m = ACTIVE_MATCHES.get(match_id)
+    if not m:
+        return
+    m["stage"] = "finished"
+    p1, p2 = m["p1"], m["p2"]
+    u1 = USERS_DB[p1]
+    is_win1 = (p1 == winner)
+    is_friendly = (m["match_type"] == "friendly")
+    is_career = (m["match_type"] == "career")
+    
+    mmr_change1 = 0
+    if not is_friendly:
+        opponent = USERS_DB[p2] if not m["is_bot"] else {"mmr": 0, "username": "бот"}
+        mmr_change1 = calculate_mmr_change(u1, opponent, "win" if is_win1 else "loss", m["score"][p1], m["score"][p2])
+        u1["mmr"] += mmr_change1
 
-# Я опустил остальные функции для краткости, но в полном коде они есть.
-# Если нужно, я выдам их отдельно.
+    unlocked1, exp_gain1 = await update_stats_and_quests(u1, "win" if is_win1 else "loss", m["score"][p1], m["score"][p2], mmr_change1, not m["is_bot"])
+
+    leader_level = u1["skills"].get("leader", 0)
+    bonus_coins = int(10 * (1 + leader_level * 0.005)) if is_win1 else 0
+    u1["coins"] += bonus_coins
+
+    chest_reward_text = ""
+    if not m["is_bot"] and is_win1 and not is_friendly:
+        if len(u1["chests"]) < 4:
+            tier = get_random_chest_tier()
+            u1["chests"].append({"tier": tier, "unlock_at": None})
+            chest_reward_text = f"\n🎁 Вы получили {CHEST_TIERS[tier]['emoji']} {CHEST_TIERS[tier]['name']} сундук!"
+        else:
+            chest_reward_text = "\n⚠️ У вас нет свободных слотов для сундука. Откройте один из существующих."
+
+    career_text = ""
+    if is_career and is_win1:
+        u1["career_stage"] += 1
+        career_text = f"\n📈 Этап карьеры повышен до {u1['career_stage']}!"
+
+    res1 = f"🏁 <b>Матч окончен!</b>\n"
+    if is_friendly:
+        res1 += f"🤝 Товарищеский матч\n"
+    if is_career:
+        res1 += f"🏆 Матч карьеры\n"
+    if forfeit:
+        res1 += f"⏰ Техническое поражение (не ответил за 15 секунд)\n"
+    if is_win1:
+        res1 += f"🎉 Победа! +{mmr_change1} ММР, +{bonus_coins} монет (бонус Лидера).\n"
+    else:
+        res1 += f"😭 Поражение. {mmr_change1} ММР.\n"
+    res1 += f"Счёт: {m['score'][p1]} - {m['score'][p2]}\n"
+    res1 += f"⚡ Опыт: +{exp_gain1}\n"
+    if chest_reward_text:
+        res1 += chest_reward_text
+    if career_text:
+        res1 += career_text
+    if unlocked1:
+        res1 += "\n🏆 <b>Новые достижения:</b>\n"
+        for ach in unlocked1:
+            res1 += f"{ach['icon']} {ach['name']} (+{ach['reward_coins']} монет, +{ach['reward_crystals']} кристаллов)\n"
+    daily_done, weekly_done = check_quest_completion(u1)
+    if daily_done:
+        res1 += "\n✅ <b>Выполнено ежедневное задание!</b>"
+    if weekly_done:
+        res1 += "\n✅ <b>Выполнено недельное задание!</b>"
+    await send_safely(p1, res1, reply_markup=back_to_main_keyboard())
+
+    if not m["is_bot"]:
+        u2 = USERS_DB[p2]
+        is_win2 = (p2 == winner)
+        mmr_change2 = 0
+        if not is_friendly:
+            mmr_change2 = calculate_mmr_change(u2, u1, "win" if is_win2 else "loss", m["score"][p2], m["score"][p1])
+            u2["mmr"] += mmr_change2
+        unlocked2, exp_gain2 = await update_stats_and_quests(u2, "win" if is_win2 else "loss", m["score"][p2], m["score"][p1], mmr_change2, False)
+        leader_level2 = u2["skills"].get("leader", 0)
+        bonus_coins2 = int(10 * (1 + leader_level2 * 0.005)) if is_win2 else 0
+        u2["coins"] += bonus_coins2
+        res2 = f"🏁 <b>Матч окончен!</b>\n"
+        if is_friendly:
+            res2 += f"🤝 Товарищеский матч\n"
+        if is_career:
+            res2 += f"🏆 Матч карьеры\n"
+        if forfeit:
+            res2 += f"⏰ Техническое поражение (не ответил за 15 секунд)\n"
+        if is_win2:
+            res2 += f"🎉 Победа! +{mmr_change2} ММР, +{bonus_coins2} монет (бонус Лидера).\n"
+        else:
+            res2 += f"😭 Поражение. {mmr_change2} ММР.\n"
+        res2 += f"Счёт: {m['score'][p2]} - {m['score'][p1]}\n"
+        res2 += f"⚡ Опыт: +{exp_gain2}\n"
+        if unlocked2:
+            res2 += "\n🏆 <b>Новые достижения:</b>\n"
+            for ach in unlocked2:
+                res2 += f"{ach['icon']} {ach['name']} (+{ach['reward_coins']} монет, +{ach['reward_crystals']} кристаллов)\n"
+        daily_done2, weekly_done2 = check_quest_completion(u2)
+        if daily_done2:
+            res2 += "\n✅ <b>Выполнено ежедневное задание!</b>"
+        if weekly_done2:
+            res2 += "\n✅ <b>Выполнено недельное задание!</b>"
+        await send_safely(p2, res2, reply_markup=back_to_main_keyboard())
+
+    IN_GAME_USERS.discard(p1)
+    if not m["is_bot"]:
+        IN_GAME_USERS.discard(p2)
+    ACTIVE_MATCHES.pop(match_id, None)
+
+async def update_stats_and_quests(user, result, goals_scored, goals_conceded, mmr_change, is_pvp):
+    stats = user["stats"]
+    stats["matches"] += 1
+    if result == "win":
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+    stats["goals"] += goals_scored
+    stats["goals_conceded"] += goals_conceded
+    stats["total_time"] += 60
+
+    user["match_history"].append({
+        "date": datetime.now().isoformat(),
+        "result": result,
+        "score": f"{goals_scored}-{goals_conceded}",
+        "opponent": "бот" if not is_pvp else "игрок",
+        "mmr_change": mmr_change
+    })
+    if len(user["match_history"]) > 20:
+        user["match_history"] = user["match_history"][-20:]
+
+    unlocked = check_achievements(user)
+
+    exp_gain = 10 + goals_scored * 2
+    if result == "win":
+        exp_gain += 15
+    add_exp(user, exp_gain)
+
+    if is_pvp:
+        check_quests_by_type(user, "play_pvp", 1)
+    else:
+        check_quests_by_type(user, "play_pve", 1)
+    if result == "win":
+        check_quests_by_type(user, "win_any", 1)
+    check_quests_by_type(user, "score", goals_scored)
+
+    return unlocked, exp_gain
+
+def check_quests_by_type(user, quest_type, amount):
+    for q in user.get("daily_quests", []):
+        if q.get("type") == quest_type and not q.get("completed", False):
+            q["current"] = q.get("current", 0) + amount
+            if q["current"] >= q["target"]:
+                q["completed"] = True
+                user["coins"] += q.get("reward_coins", 0)
+                user["crystals"] += q.get("reward_crystals", 0)
+                if "reward_xp" in q:
+                    add_exp(user, q["reward_xp"])
+    for q in user.get("weekly_quests", []):
+        if q.get("type") == quest_type and not q.get("completed", False):
+            q["current"] = q.get("current", 0) + amount
+            if q["current"] >= q["target"]:
+                q["completed"] = True
+                user["coins"] += q.get("reward_coins", 0)
+                user["crystals"] += q.get("reward_crystals", 0)
+
+def check_quest_completion(user):
+    daily_done = False
+    for q in user.get("daily_quests", []):
+        if q.get("completed", False):
+            daily_done = True
+    weekly_done = False
+    for q in user.get("weekly_quests", []):
+        if q.get("completed", False):
+            weekly_done = True
+    return daily_done, weekly_done
+
+# ======================================================
+# ===== КОМАНДЫ =====
+# ======================================================
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    text = (
+        "📋 <b>Список доступных команд:</b>\n\n"
+        "⚽ <b>Игра</b>\n"
+        "/start - Начать игру\n"
+        "/profile [@username] - Просмотр профиля\n"
+        "/setname Новое имя - Сменить никнейм\n"
+        "/timeattack - Режим 'На время' (90 сек)\n"
+        "/create_room - Создать закрытую комнату\n"
+        "/invite_room @username room_id - Пригласить в комнату\n"
+        "/join_room room_id - Присоединиться к комнате\n"
+        "/room_chat room_id - Включить/выключить чат в комнате\n"
+        "/start_room room_id - Начать матч в комнате\n\n"
+        "👥 <b>Друзья</b>\n"
+        "/friends - Список друзей\n"
+        "/addfriend @username - Отправить заявку в друзья\n\n"
+        "🛡 <b>Кланы</b>\n"
+        "/setclanchat ссылка - привязать группу к клану (только владелец)\n\n"
+        "📈 <b>Прогресс</b>\n"
+        "/referral - Реферальная ссылка\n"
+        "/verify - Верификация\n"
+        "/notifications - Уведомления\n"
+        "/upgrade_skill [название] - Улучшить навык\n\n"
+        "ℹ️ <b>Другое</b>\n"
+        "/help - Это сообщение\n"
+    )
+    await message.answer(text)
+
+@dp.message(Command("timeattack"))
+async def time_attack_cmd(message: Message):
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    if user.get("banned"):
+        await message.answer("❌ Вы забанены!")
+        return
+    if user["energy"] < 1:
+        await message.answer("❌ Нет энергии!")
+        return
+    user["energy"] -= 1
+    IN_GAME_USERS.add(message.from_user.id)
+    match_id = f"ta_{message.from_user.id}_{random.randint(1000,9999)}"
+    ACTIVE_MATCHES[match_id] = {
+        "p1": message.from_user.id,
+        "p2": "ai_bot",
+        "is_bot": True,
+        "match_type": "timeattack",
+        "p1_name": user["username"],
+        "p2_name": "🤖 Вратарь",
+        "score": {message.from_user.id: 0},
+        "round": 1,
+        "stage": "atk_choosing",
+        "attacker": message.from_user.id,
+        "defender": "ai_bot",
+        "atk_choice": None,
+        "ult_used": {message.from_user.id: False},
+        "messages": {message.from_user.id: None},
+        "time_start": time.time(),
+        "time_limit": 90,
+        "player_responded": False
+    }
+    await bot.send_message(
+        message.from_user.id,
+        f"⏱️ <b>Режим 'На время'</b>\nУ вас 90 секунд. Бейте по воротам!\n\nВыберите направление:",
+        reply_markup=game_choice_keyboard(match_id, "atk", True)
+    )
+    asyncio.create_task(timeattack_timer(match_id))
+
+async def timeattack_timer(match_id):
+    await asyncio.sleep(90)
+    m = ACTIVE_MATCHES.get(match_id)
+    if not m:
+        return
+    if m["stage"] != "finished":
+        m["stage"] = "finished"
+        user_id = m["p1"]
+        user = USERS_DB[user_id]
+        goals = m["score"][user_id]
+        mmr_gain = goals * 2
+        user["mmr"] += mmr_gain
+        unlocked, exp_gain = await update_stats_and_quests(user, "time_attack", goals, 0, mmr_gain, False)
+        check_quests_by_type(user, "play_time", 1)
+        daily_done, weekly_done = check_quest_completion(user)
+        res = f"⏱️ <b>Время вышло!</b>\nВы забили {goals} голов!\n🏅 +{exp_gain} опыта, +{mmr_gain} ММР."
+        if unlocked:
+            res += "\n\n🏆 <b>Новые достижения:</b>\n"
+            for ach in unlocked:
+                res += f"{ach['icon']} {ach['name']} (+{ach['reward_coins']} монет, +{ach['reward_crystals']} кристаллов)\n"
+        if daily_done:
+            res += "\n✅ <b>Выполнено ежедневное задание!</b>"
+        if weekly_done:
+            res += "\n✅ <b>Выполнено недельное задание!</b>"
+        await bot.send_message(user_id, res, reply_markup=back_to_main_keyboard())
+        IN_GAME_USERS.discard(user_id)
+        ACTIVE_MATCHES.pop(match_id, None)
+
+@dp.message(Command("referral"))
+async def referral_cmd(message: Message):
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    ref_link = f"https://t.me/oneononepvp_bot?start=ref_{message.from_user.id}"
+    text = f"👥 Ваша реферальная ссылка:\n{ref_link}\n\nЗа каждого приглашённого друга вы получите 50 монет и 5 кристаллов, когда он сыграет первый матч."
+    referrals = user.get("referrals", [])
+    text += f"\nПриглашено: {len(referrals)} человек."
+    await message.answer(text)
+
+@dp.message(Command("verify"))
+async def verify_cmd(message: Message):
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    if user.get("verified"):
+        await message.answer("Вы уже верифицированы.")
+        return
+    num = random.randint(1000, 9999)
+    if not hasattr(verify_cmd, "cache"):
+        verify_cmd.cache = {}
+    verify_cmd.cache[message.from_user.id] = num
+    await message.answer(f"🔐 Для верификации введите число: {num}")
+
+@dp.message(F.text.regexp(r'^\d{4,5}$'))
+async def verify_answer(message: Message):
+    if not hasattr(verify_cmd, "cache"):
+        return
+    if message.from_user.id not in verify_cmd.cache:
+        return
+    if int(message.text) == verify_cmd.cache[message.from_user.id]:
+        user = get_or_create_user(message.from_user.id)
+        user["verified"] = True
+        del verify_cmd.cache[message.from_user.id]
+        await message.answer("✅ Вы успешно верифицированы! Теперь у вас есть значок ✅ в профиле.")
+    else:
+        await message.answer("❌ Неверный код. Попробуйте снова /verify")
+
+@dp.message(Command("notifications"))
+async def notifications_cmd(message: Message):
+    user = get_or_create_user(message.from_user.id, message.from_user.username)
+    user["notifications"] = not user.get("notifications", True)
+    status = "включены" if user["notifications"] else "выключены"
+    await message.answer(f"🔔 Уведомления {status}.")
+
+# ======================================================
+# ===== АДМИН-КОМАНДЫ =====
+# ======================================================
+
+@dp.message(Command("export"))
+async def export_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Username", "MMR", "Level", "Coins", "Crystals", "Matches", "Wins", "Losses", "Goals", "Saves", "Chests"])
+    for uid, data in USERS_DB.items():
+        stats = data.get("stats", {})
+        chest_count = len(data.get("chests", []))
+        writer.writerow([
+            uid,
+            data.get("username", ""),
+            data.get("mmr", 0),
+            data.get("level", 1),
+            data.get("coins", 0),
+            data.get("crystals", 0),
+            stats.get("matches", 0),
+            stats.get("wins", 0),
+            stats.get("losses", 0),
+            stats.get("goals", 0),
+            stats.get("saves", 0),
+            chest_count
+        ])
+    csv_text = output.getvalue()
+    output.close()
+    file = BytesIO(csv_text.encode('utf-8-sig'))
+    file.name = "users_export.csv"
+    await message.answer_document(file, caption="📊 Экспорт базы пользователей")
+
+@dp.message(Command("add_coins"))
+async def add_coins_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Использование: /add_coins @username количество")
+        return
+    target_username = args[1].replace("@", "")
+    try:
+        amount = int(args[2])
+    except:
+        await message.answer("Количество должно быть числом.")
+        return
+    for uid, data in USERS_DB.items():
+        if data.get("username") == target_username:
+            data["coins"] += amount
+            await message.answer(f"✅ Добавлено {amount} монет игроку {target_username}.")
+            return
+    await message.answer("Игрок не найден.")
+
+@dp.message(Command("give_crystal"))
+async def give_crystal_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Использование: /give_crystal @username количество")
+        return
+    target_username = args[1].replace("@", "")
+    try:
+        amount = int(args[2])
+    except:
+        await message.answer("Количество должно быть числом.")
+        return
+    for uid, data in USERS_DB.items():
+        if data.get("username") == target_username:
+            data["crystals"] += amount
+            await message.answer(f"✅ Добавлено {amount} кристаллов игроку {target_username}.")
+            return
+    await message.answer("Игрок не найден.")
+
+@dp.message(Command("ban"))
+async def ban_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /ban @username")
+        return
+    target_username = args[1].replace("@", "")
+    for uid, data in USERS_DB.items():
+        if data.get("username") == target_username:
+            data["banned"] = True
+            await message.answer(f"🚫 Игрок {target_username} забанен.")
+            return
+    await message.answer("Игрок не найден.")
+
+@dp.message(Command("reset_tourney"))
+async def reset_tourney_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    for uid, data in USERS_DB.items():
+        data["tourney_active"] = False
+        data["tourney_wins"] = 0
+    await message.answer("✅ Турнир сброшен для всех игроков.")
+
+@dp.message(Command("send_all"))
+async def send_all_cmd(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Только для администратора.")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /send_all текст")
+        return
+    text = args[1]
+    sent = 0
+    for uid in USERS_DB:
+        try:
+            await bot.send_message(uid, f"📢 <b>Объявление от администрации</b>\n\n{text}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
+    await message.answer(f"✅ Рассылка завершена. Отправлено {sent} сообщений.")
+
+# ===== БЭКАП =====
+async def backup_task():
+    while True:
+        await asyncio.sleep(3600 * 6)
+        logger.info("🔄 Бэкап: копирование базы (заглушка)")
+
+# ===== ЗАПУСК =====
+async def main():
+    os.makedirs("data", exist_ok=True)
+    load_db()
+    asyncio.create_task(db_autosave_task())
+    asyncio.create_task(backup_task())
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
