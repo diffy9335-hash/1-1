@@ -1948,15 +1948,13 @@ async def check_timeout(match_id, player_id):
         else:
             defender_name = m["p2_name"] if p2 == "ai_bot" else m["p1_name"]
         
-        # ЗАСЧИТЫВАЕМ ГОЛ ИГРОКУ, А НЕ БОТУ
+        # ЗАСЧИТЫВАЕМ ГОЛ атакующему (если бот - то боту, если игрок - то игроку)
         if attacker_id != "ai_bot":
             m["score"][attacker_id] = m["score"].get(attacker_id, 0) + 1
         else:
-            # Если атакует бот (редкий случай) - гол игроку в защите
-            if p1 != "ai_bot":
-                m["score"][p1] = m["score"].get(p1, 0) + 1
-            else:
-                m["score"][p2] = m["score"].get(p2, 0) + 1
+            # гол боту
+            bot_id = p1 if p1 == "ai_bot" else p2
+            m["score"][bot_id] = m["score"].get(bot_id, 0) + 1
         
         details = f"⏰ {attacker_name} забивает гол! {defender_name} не ответил за 15 секунд."
         await bot.send_message(p1, f"⚽ {details}")
@@ -2143,16 +2141,14 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
             is_goal = True
             details = f"🔥 ГОЛ! {attacker_name} пробил в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
     
-    # ГОЛ ЗАСЧИТЫВАЕТСЯ ТОЛЬКО АТАКУЮЩЕМУ (ИГРОКУ, А НЕ БОТУ!)
+    # ГОЛ ЗАСЧИТЫВАЕТСЯ АТАКУЮЩЕМУ (игроку или боту правильно)
     if is_goal:
         if attacker != "ai_bot":
             m["score"][attacker] = m["score"].get(attacker, 0) + 1
         else:
-            # Если атакует бот - засчитываем гол игроку, который в защите
-            if p1 != "ai_bot":
-                m["score"][p1] = m["score"].get(p1, 0) + 1
-            else:
-                m["score"][p2] = m["score"].get(p2, 0) + 1
+            # гол боту
+            bot_id = p1 if p1 == "ai_bot" else p2
+            m["score"][bot_id] = m["score"].get(bot_id, 0) + 1
     
     res_msg = f"{details}\n\n📊 Счет: {m['p1_name']} [{m['score'][p1]}] : [{m['score'][p2]}] {m['p2_name']}"
     m["round"] += 1
