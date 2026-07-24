@@ -1856,7 +1856,7 @@ async def start_tourney_match(callback: CallbackQuery):
     await callback.message.edit_text(f"🥇 Выход на поле (Этап турнира {user['tourney_wins'] + 1}/3)...")
     asyncio.create_task(init_game_session(user_id, "ai_bot", match_type="tourney"))
 
-# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ИСПРАВЛЕННЫМИ ГОЛАМИ =====
+# ===== ОСНОВНАЯ ФУНКЦИЯ МАТЧА С ИСПРАВЛЕННЫМИ ГОЛАМИ И ТАЙМАУТОМ =====
 async def init_game_session(p1, p2, match_type="pvp"):
     u1 = USERS_DB[p1]
     is_bot = (p2 == "ai_bot")
@@ -1883,7 +1883,8 @@ async def init_game_session(p1, p2, match_type="pvp"):
         "ult_used": {p1: False, p2: False if is_bot else False},
         "messages": {p1: msg1.message_id if msg1 else None, p2: msg2.message_id if msg2 else None},
         "last_action_time": time.time(),
-        "player_responded": False
+        "player_responded": False,
+        "round_id": 0  # ДОБАВЛЕНО
     }
     await asyncio.sleep(1.5)
     await execute_match_turn(match_id)
@@ -1896,6 +1897,8 @@ async def execute_match_turn(match_id):
     r = m["round"]
     m["last_action_time"] = time.time()
     m["player_responded"] = False
+    m["round_id"] = m.get("round_id", 0) + 1   # Увеличиваем ID раунда
+    round_id = m["round_id"]                    # Запоминаем для таймера
     
     if m["is_bot"] and atk == "ai_bot":
         m["atk_choice"] = random.choice(["left", "center", "right"])
@@ -1905,7 +1908,7 @@ async def execute_match_turn(match_id):
         m["stage"] = "def_guessing"
         def_text = f"<b>Раунд {r}</b>\n\n🤖 Противник нанес скрытый удар! Куда прыгаем?"
         await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text, reply_markup=game_choice_keyboard(match_id, "def", not m["ult_used"][dfn]))
-        asyncio.create_task(check_timeout(match_id, dfn))
+        asyncio.create_task(check_timeout(match_id, dfn, round_id))
         return
     atk_text = f"<b>Раунд {r}</b>\n\n🔥 Ваша <b>АТАКУЮЩАЯ</b> очередь. Куда пробьем?"
     try:
@@ -1918,14 +1921,17 @@ async def execute_match_turn(match_id):
             await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text)
         except Exception:
             pass
-    asyncio.create_task(check_timeout(match_id, atk))
+    asyncio.create_task(check_timeout(match_id, atk, round_id))
 
-async def check_timeout(match_id, player_id):
+async def check_timeout(match_id, player_id, round_id):
     await asyncio.sleep(15)
     m = ACTIVE_MATCHES.get(match_id)
     if not m or m.get("stage") == "finished":
         return
     if m.get("player_responded", False):
+        return
+    # Если раунд изменился – игнорируем старый таймер
+    if m.get("round_id", 0) != round_id:
         return
     
     attacker = m["attacker"]
@@ -1935,7 +1941,7 @@ async def check_timeout(match_id, player_id):
     p2 = m["p2"]
     
     if m["stage"] == "def_guessing" and defender == player_id:
-        # Защитник не ответил - гол атакующему
+        # Защитник не ответил – гол атакующему
         attacker_id = attacker
         
         if attacker_id != "ai_bot":
@@ -1948,11 +1954,10 @@ async def check_timeout(match_id, player_id):
         else:
             defender_name = m["p2_name"] if p2 == "ai_bot" else m["p1_name"]
         
-        # ЗАСЧИТЫВАЕМ ГОЛ атакующему (если бот - то боту, если игрок - то игроку)
+        # Засчитываем гол атакующему (игроку или боту)
         if attacker_id != "ai_bot":
             m["score"][attacker_id] = m["score"].get(attacker_id, 0) + 1
         else:
-            # гол боту
             bot_id = p1 if p1 == "ai_bot" else p2
             m["score"][bot_id] = m["score"].get(bot_id, 0) + 1
         
@@ -1974,7 +1979,7 @@ async def check_timeout(match_id, player_id):
             await execute_match_turn(match_id)
             
     elif m["stage"] == "atk_choosing" and attacker == player_id:
-        # Атакующий не ответил - ход переходит сопернику
+        # Атакующий не ответил – ход переходит сопернику
         if player_id != "ai_bot":
             attacker_name = USERS_DB[player_id]["username"]
         else:
@@ -2075,7 +2080,7 @@ async def process_game_callbacks(callback: CallbackQuery):
         else:
             def_text = f"<b>Раунд {m['round']}</b>\n\n⚡ Нападающий бьет! Твой прыжок:"
             await bot.edit_message_text(chat_id=dfn, message_id=m["messages"][dfn], text=def_text, reply_markup=game_choice_keyboard(match_id, "def", not m["ult_used"][dfn]))
-            asyncio.create_task(check_timeout(match_id, dfn))
+            asyncio.create_task(check_timeout(match_id, dfn, m["round_id"]))
     elif role == "def" and m["stage"] == "def_guessing" and uid == dfn:
         if choice == "ult":
             m["ult_used"][dfn] = True
@@ -2099,7 +2104,6 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
     defender = m["defender"]
     is_bot = m["is_bot"]
     
-    # Правильно определяем имена
     if attacker != "ai_bot":
         attacker_name = USERS_DB[attacker]["username"]
     else:
@@ -2141,12 +2145,11 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
             is_goal = True
             details = f"🔥 ГОЛ! {attacker_name} пробил в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
     
-    # ГОЛ ЗАСЧИТЫВАЕТСЯ АТАКУЮЩЕМУ (игроку или боту правильно)
+    # Засчитываем гол атакующему (игроку или боту)
     if is_goal:
         if attacker != "ai_bot":
             m["score"][attacker] = m["score"].get(attacker, 0) + 1
         else:
-            # гол боту
             bot_id = p1 if p1 == "ai_bot" else p2
             m["score"][bot_id] = m["score"].get(bot_id, 0) + 1
     
@@ -2401,7 +2404,8 @@ async def time_attack_cmd(message: Message):
         "messages": {message.from_user.id: None},
         "time_start": time.time(),
         "time_limit": 90,
-        "player_responded": False
+        "player_responded": False,
+        "round_id": 0
     }
     await bot.send_message(
         message.from_user.id,
