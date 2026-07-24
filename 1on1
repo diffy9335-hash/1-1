@@ -289,12 +289,15 @@ def get_or_create_user(user_id, username=None):
         "career_stage": 1,
         "tourney_active": False,
         "tourney_wins": 0,
-        "current_quest": {"type": "play_pvp", "target": 1, "current": 0, "xp_reward": 10, "text": "⚽ Сыграть 1 PvP матч"}
+        "current_quest": {"type": "play_pvp", "target": 1, "current": 0, "xp_reward": 10, "text": "⚽ Сыграть 1 PvP матч"},
+        "name_changes": 0  # <--- НОВОЕ ПОЛЕ
     }
     for key, val in defaults.items():
         if key not in u:
             u[key] = val
-    if username:
+
+    # Устанавливаем ник только если его нет или он равен дефолтному
+    if username and (u.get("username") is None or u["username"].startswith("Игрок_")):
         u["username"] = username
 
     now = time.time()
@@ -634,7 +637,7 @@ async def back_to_main(callback: CallbackQuery):
         f"📊 Этап Карьеры: {user['career_stage']}", reply_markup=main_menu_keyboard(user)
     )
 
-# ===== СМЕНА НИКНЕЙМА =====
+# ===== СМЕНА НИКНЕЙМА (ИСПРАВЛЕННАЯ) =====
 @dp.message(Command("setname"))
 async def set_name_cmd(message: Message):
     args = message.text.split(maxsplit=1)
@@ -645,11 +648,49 @@ async def set_name_cmd(message: Message):
     if len(new_name) < 2 or len(new_name) > 30:
         await message.answer("❌ Имя должно быть от 2 до 30 символов.")
         return
+
     user = get_or_create_user(message.from_user.id)
+    changes = user.get("name_changes", 0)
+
+    # Определяем стоимость
+    if changes == 0:
+        cost = 0
+        cost_text = "бесплатно"
+    elif changes == 1:
+        cost = 30
+        cost_text = "30 💎"
+    elif changes == 2:
+        cost = 50
+        cost_text = "50 💎"
+    else:
+        cost = 100
+        cost_text = "100 💎"
+
+    if cost > 0 and user["crystals"] < cost:
+        await message.answer(
+            f"❌ Недостаточно кристаллов!\n"
+            f"Стоимость смены: {cost_text}\n"
+            f"У вас: {user['crystals']} 💎"
+        )
+        return
+
+    # Списываем кристаллы
+    if cost > 0:
+        user["crystals"] -= cost
+
+    # Меняем имя
     old_name = user["username"]
     user["username"] = new_name
+    user["name_changes"] = changes + 1
     save_db()
-    await message.answer(f"✅ Ваше имя успешно изменено!\n\nСтарое имя: {old_name}\nНовое имя: {new_name}")
+
+    await message.answer(
+        f"✅ Имя успешно изменено!\n\n"
+        f"Старое имя: {old_name}\n"
+        f"Новое имя: {new_name}\n"
+        f"Стоимость: {cost_text}\n"
+        f"Всего смен: {user['name_changes']}"
+    )
 
 # ===== АДМИН-ПАНЕЛЬ =====
 @dp.callback_query(F.data == "admin_panel")
@@ -1884,7 +1925,7 @@ async def init_game_session(p1, p2, match_type="pvp"):
         "messages": {p1: msg1.message_id if msg1 else None, p2: msg2.message_id if msg2 else None},
         "last_action_time": time.time(),
         "player_responded": False,
-        "round_id": 0  # ДОБАВЛЕНО
+        "round_id": 0
     }
     await asyncio.sleep(1.5)
     await execute_match_turn(match_id)
@@ -1897,8 +1938,8 @@ async def execute_match_turn(match_id):
     r = m["round"]
     m["last_action_time"] = time.time()
     m["player_responded"] = False
-    m["round_id"] = m.get("round_id", 0) + 1   # Увеличиваем ID раунда
-    round_id = m["round_id"]                    # Запоминаем для таймера
+    m["round_id"] = m.get("round_id", 0) + 1
+    round_id = m["round_id"]
     
     if m["is_bot"] and atk == "ai_bot":
         m["atk_choice"] = random.choice(["left", "center", "right"])
@@ -1930,7 +1971,6 @@ async def check_timeout(match_id, player_id, round_id):
         return
     if m.get("player_responded", False):
         return
-    # Если раунд изменился – игнорируем старый таймер
     if m.get("round_id", 0) != round_id:
         return
     
@@ -1941,7 +1981,6 @@ async def check_timeout(match_id, player_id, round_id):
     p2 = m["p2"]
     
     if m["stage"] == "def_guessing" and defender == player_id:
-        # Защитник не ответил – гол атакующему
         attacker_id = attacker
         
         if attacker_id != "ai_bot":
@@ -1954,7 +1993,6 @@ async def check_timeout(match_id, player_id, round_id):
         else:
             defender_name = m["p2_name"] if p2 == "ai_bot" else m["p1_name"]
         
-        # Засчитываем гол атакующему (игроку или боту)
         if attacker_id != "ai_bot":
             m["score"][attacker_id] = m["score"].get(attacker_id, 0) + 1
         else:
@@ -1979,7 +2017,6 @@ async def check_timeout(match_id, player_id, round_id):
             await execute_match_turn(match_id)
             
     elif m["stage"] == "atk_choosing" and attacker == player_id:
-        # Атакующий не ответил – ход переходит сопернику
         if player_id != "ai_bot":
             attacker_name = USERS_DB[player_id]["username"]
         else:
@@ -2145,7 +2182,6 @@ async def handle_round_resolution(match_id, atk_choice, def_choice):
             is_goal = True
             details = f"🔥 ГОЛ! {attacker_name} пробил в {get_dir_name(atk_choice)}, а {defender_name} прыгнул в {get_dir_name(def_choice)}"
     
-    # Засчитываем гол атакующему (игроку или боту)
     if is_goal:
         if attacker != "ai_bot":
             m["score"][attacker] = m["score"].get(attacker, 0) + 1
