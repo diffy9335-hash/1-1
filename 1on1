@@ -290,13 +290,12 @@ def get_or_create_user(user_id, username=None):
         "tourney_active": False,
         "tourney_wins": 0,
         "current_quest": {"type": "play_pvp", "target": 1, "current": 0, "xp_reward": 10, "text": "⚽ Сыграть 1 PvP матч"},
-        "name_changes": 0  # <--- НОВОЕ ПОЛЕ
+        "name_changes": 0
     }
     for key, val in defaults.items():
         if key not in u:
             u[key] = val
 
-    # Устанавливаем ник только если его нет или он равен дефолтному
     if username and (u.get("username") is None or u["username"].startswith("Игрок_")):
         u["username"] = username
 
@@ -637,7 +636,7 @@ async def back_to_main(callback: CallbackQuery):
         f"📊 Этап Карьеры: {user['career_stage']}", reply_markup=main_menu_keyboard(user)
     )
 
-# ===== СМЕНА НИКНЕЙМА (ИСПРАВЛЕННАЯ) =====
+# ===== СМЕНА НИКНЕЙМА (С ПРОВЕРКОЙ УНИКАЛЬНОСТИ) =====
 @dp.message(Command("setname"))
 async def set_name_cmd(message: Message):
     args = message.text.split(maxsplit=1)
@@ -645,10 +644,22 @@ async def set_name_cmd(message: Message):
         await message.answer("❌ Использование: /setname Новое имя")
         return
     new_name = args[1].strip()
+    
     if len(new_name) < 2 or len(new_name) > 30:
         await message.answer("❌ Имя должно быть от 2 до 30 символов.")
         return
-
+    
+    # ===== ПРОВЕРКА УНИКАЛЬНОСТИ =====
+    for uid, data in USERS_DB.items():
+        if uid == message.from_user.id:
+            continue
+        if data.get("username", "").lower() == new_name.lower():
+            await message.answer(
+                f"❌ Имя <b>{new_name}</b> уже занято другим игроком!\n"
+                f"Пожалуйста, выберите другое имя."
+            )
+            return
+    
     user = get_or_create_user(message.from_user.id)
     changes = user.get("name_changes", 0)
 
